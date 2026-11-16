@@ -12,7 +12,7 @@
     marine: {swell_wave_height:'m', swell_wave_period:'s', swell_wave_direction:'°'}
   };
   const metrics = {
-    turbidity:['浑浊风险','等级','#087d71',0],
+    turbidity:['浊度估算','FNU','#087d71',1],
     wind:['风速','m/s','#087d71',1], swell:['外海涌浪有效波高','m','#3169a9',2],
     tide:['Stony Point 参考潮位','m LAT','#9b601a',2], rain:['小时降雨','mm','#6b559c',1]
   };
@@ -33,7 +33,9 @@
   let point = remembered && Number.isFinite(remembered.lat) && Number.isFinite(remembered.lng) && extent.contains(remembered) ? remembered : initial;
   let range = 'week', day = 0, active = 0, metric = 'turbidity', rows = [], chartX = null;
   let windData, marineData, windBusy = false, marineBusy = false, windError = false, marineError = false;
-  let windJob, marineJob, marineFlight;
+  let sensorData, sensorBusy = false, sensorError = false, fittedModel = null;
+  let windJob, marineJob, marineFlight, sensorJob;
+  const localApi = location.protocol==='http:'&&location.hostname==='127.0.0.1' ? '' : 'http://127.0.0.1:8768';
 
   const map = L.map('map',{scrollWheelZoom:false, maxBounds:extent.pad(.15), maxBoundsViscosity:1, minZoom:8, maxZoom:15, zoomSnap:.25, attributionControl:false});
   const credit = L.control.attribution({prefix:false}).addTo(map);
@@ -117,6 +119,64 @@
     const [ta,ya]=tides[a], [tb,yb]=tides[b];
     return (ya+yb)/2+(ya-yb)/2*Math.cos(Math.PI*(t-ta)/(tb-ta));
   }
+  const median = values => {
+    const sorted=values.filter(Number.isFinite).sort((a,b)=>a-b),n=sorted.length;
+    return n?((n%2)?sorted[(n-1)/2]:(sorted[n/2-1]+sorted[n/2])/2):null;
+  };
+  function solve(matrix,vector){
+    const n=vector.length,a=matrix.map((row,i)=>[...row,vector[i]]);
+    for(let c=0;c<n;c++){
+      let p=c;for(let r=c+1;r<n;r++)if(Math.abs(a[r][c])>Math.abs(a[p][c]))p=r;
+      if(Math.abs(a[p][c])<1e-10)return null;
+      [a[c],a[p]]=[a[p],a[c]];const d=a[c][c];for(let j=c;j<=n;j++)a[c][j]/=d;
+      for(let r=0;r<n;r++)if(r!==c){const f=a[r][c];for(let j=c;j<=n;j++)a[r][j]-=f*a[c][j];}
+    }
+    return a.map(row=>row[n]);
+  }
+  const vector = (h,prev,weather,rain) => {
+    const wind=weather.get(h)?.[0],rate=(tideAt(h+3600)-tideAt(h-3600))/2;
+    const stress=Number.isFinite(wind)?Math.max(0,wind*wind-16):0;
+    const ebb=Number.isFinite(rate)?Math.max(0,-rate):0;
+    const flood=Number.isFinite(rate)?Math.max(0,rate):0;
+    const rain6=Array.from({length:6},(_,i)=>rain.get(h-i*3600)??0).reduce((a,b)=>a+b,0);
+    return [1,prev,stress,ebb,flood,rain6,stress*ebb];
+  };
+  function fitTurbidityModel(){
+    if(!sensorData?.history?.length||!sensorData?.weather?.time?.length)return null;
+    const w=sensorData.weather,{time,wind_speed_10m,precipitation}=w;
+    const weather=new Map(),rain=new Map();
+    time.forEach((t,i)=>{const h=Math.floor(t/3600)*3600;weather.set(h,[wind_speed_10m[i]]);rain.set(h,precipitation[i]);});
+    const byHour=new Map();
+    for(const [t,v] of sensorData.history){const h=Math.floor(t/3600)*3600;(byHour.get(h)||byHour.set(h,[]).get(h)).push(v);}
+    const hours=[...byHour.keys()].sort((a,b)=>a-b),obs=new Map(hours.map(h=>[h,median(byHour.get(h))]));
+    const warmup=hours[0]+96*3600,records=[];
+    for(const h of hours){
+      if(h<warmup||!obs.has(h-3600)||!weather.has(h)||!Number.isFinite(obs.get(h)))continue;
+      records.push({h,x:vector(h,obs.get(h-3600),weather,rain),y:obs.get(h),previous:obs.get(h-3600)});
+    }
+    if(records.length<120)return null;
+    const split=Math.max(60,Math.floor(records.length*.72)),training=records.slice(0,split),validation=records.slice(split);
+    const n=7,matrix=Array.from({length:n},()=>Array(n).fill(0)),target=Array(n).fill(0);
+    for(const row of training)for(let i=0;i<n;i++){
+      target[i]+=row.x[i]*row.y;
+      for(let j=0;j<n;j++)matrix[i][j]+=row.x[i]*row.x[j];
+    }
+    for(let i=2;i<n;i++)matrix[i][i]+=1e-5;
+    const beta=solve(matrix,target);if(!beta)return null;
+    const mae=fn=>validation.reduce((s,r)=>s+Math.abs(r.y-fn(r)),0)/validation.length;
+    const modelMae=mae(r=>r.x.reduce((s,v,i)=>s+v*beta[i],0));
+    const persistenceMae=mae(r=>r.previous);
+    return {beta,skill:1-modelMae/persistenceMae,modelMae,persistenceMae,samples:records.length,trained:training.length};
+  }
+  function loadSensor(){
+    sensorJob?.abort();const job=sensorJob=new AbortController();sensorBusy=true;sensorError=false;
+    const timer=setTimeout(()=>job.abort(),30000);render();
+    fetch(localApi+'/api/turbidity',{signal:job.signal})
+      .then(r=>{if(!r.ok)throw Error('IMOS unavailable');return r.json();})
+      .then(data=>{if(job!==sensorJob)return;sensorData=data;put('turbidity',data);})
+      .catch(()=>{if(job===sensorJob){sensorError=true;sensorData=get('turbidity');}})
+      .finally(()=>{clearTimeout(timer);if(job===sensorJob){sensorBusy=false;render();}});
+  }
   function render(){
     const start=startHour(), saved=rows[active]?.t;
     rows = Array.from({length:168},(_,i)=>{
@@ -124,21 +184,20 @@
         [swell,period,swellDir]=marineData?.values.get(t)??[null,null,null];
       return {t,wind,windDir,rain,swell,period,swellDir,tide:tideAt(t)};
     });
-    rows.forEach((r,i)=>{
-      const recentRain=rows.slice(Math.max(0,i-5),i+1).reduce((s,x)=>s+(Number.isFinite(x.rain)?x.rain:0),0);
-      const a=rows[Math.max(0,i-3)]?.tide,b=rows[Math.min(rows.length-1,i+3)]?.tide;
-      const tideRate=Number.isFinite(a)&&Number.isFinite(b)?Math.abs(b-a):null;
-      const allTerms=[
-        Number.isFinite(r.wind)?Math.max(0,Math.min(35,(r.wind-2)*4.4)):null,
-        Number.isFinite(r.swell)?Math.max(0,Math.min(20,(r.swell-.25)*9)):null,
-        Number.isFinite(tideRate)?Math.max(0,Math.min(18,tideRate*24)):null,
-        rows.slice(Math.max(0,i-5),i+1).some(x=>Number.isFinite(x.rain))?Math.max(0,Math.min(20,recentRain*2)):null
-      ];
-      const weights=[35,20,18,20],terms=allTerms.filter(Number.isFinite);
-      r.riskInputs=terms.length;
-      r.risk=terms.length>=2?terms.reduce((s,x)=>s+x,0)/weights.filter((_,j)=>Number.isFinite(allTerms[j])).reduce((s,x)=>s+x,0)*93:null;
-      r.turbidity=Number.isFinite(r.risk)?(r.risk<22?0:r.risk<48?1:2):null;
-    });
+    const fitted=fittedModel=fitTurbidityModel(),latest=sensorData?.latest;
+    const recent=sensorData?.history?.filter(([t,v])=>Number.isFinite(v)&&t>=start-2*3600&&t<=startHour()+3600).map(([,v])=>v)??[];
+    let concentration=median(recent);if(!Number.isFinite(concentration)&&Number.isFinite(latest?.value))concentration=latest.value;
+    const beta=fitted?.beta, wx=sensorData?.weather?.time??[],ws=sensorData?.weather?.wind_speed_10m??[],rs=sensorData?.weather?.precipitation??[];
+    const histWind=new Map(wx.map((t,i)=>[Math.floor(t/3600)*3600,[ws[i]]]));
+    const histRain=new Map(wx.map((t,i)=>[Math.floor(t/3600)*3600,rs[i]]));
+    for(let i=0;i<rows.length;i++){
+      const r=rows[i],h=r.t,forecastWind=Number.isFinite(r.wind)?r.wind:null;
+      if(!Number.isFinite(concentration)||!Number.isFinite(forecastWind)||!beta){r.turbidity=null;continue;}
+      histWind.set(h,[forecastWind]);histRain.set(h,Number.isFinite(r.rain)?r.rain:0);
+      const x=vector(h,concentration,histWind,histRain);
+      concentration=Math.max(0,Math.min(4000,x.reduce((s,v,j)=>s+v*beta[j],0)));
+      r.turbidity=concentration;
+    }
     if(saved!==undefined&&saved!==rows[active].t){
       active=Math.max(0,Math.min(167,Math.round((saved-start)/hour)));day=Math.floor(active/24);
     }
@@ -151,16 +210,17 @@
       if(error)return '缓存 '+stamp(Date.parse(data.at)/1000);
       return n===168?'已更新':n+'/168 小时';
     });
-    $('status').textContent='风 '+states[0]+' · 浪 '+states[1];
+    const obsTime=sensorData?.latest?.time,obsAge=Number.isFinite(obsTime)?(Date.now()/1000-obsTime)/3600:Infinity;
+    const obsState=sensorBusy?'浊度更新中':Number.isFinite(sensorData?.latest?.value)?(sensorError?'浊度缓存':'浊度实测'):'浊度无数据';
+    $('status').textContent=obsState+' · 风 '+states[0]+' · 浪 '+states[1];
     $('refresh').disabled=windBusy||marineBusy;
     for(const [i,button] of [...$('days').children].entries()){
       const interval = rows.slice(i*24,(i+1)*24);
       const peak = k => interval.some(r=>Number.isFinite(r[k]))?Math.max(...interval.map(r=>r[k]??-Infinity)):null;
       button.firstElementChild.textContent=stamp(interval[0].t);
-      const risk=peak('turbidity'),riskName=['较低','中等','较高'][risk]??'待更新';
-      button.lastElementChild.textContent=riskName+'风险';
-      button.setAttribute('aria-label',stamp(interval[0].t)+' 起 24 小时：浑浊风险'+riskName);
-      button.dataset.risk=Number.isFinite(risk)?String(risk):'unknown';
+      const estimate=peak('turbidity');
+      button.lastElementChild.textContent=Number.isFinite(estimate)?f(estimate,1)+' FNU':'无数据';
+      button.setAttribute('aria-label',stamp(interval[0].t)+' 起 24 小时：浊度估算最高 '+(Number.isFinite(estimate)?f(estimate,1)+' FNU':'暂无数据'));
     }
     syncControls();draw();readout();
   }
@@ -172,9 +232,10 @@
   }
   function readout(){
     const r=rows[active];if(!r)return;
+    const obsTime=sensorData?.latest?.time;
     $('selected-time').textContent=stamp(r.t);$('selected-time').dateTime=new Date(r.t*1000).toISOString();
     const [,unit,,digits]=metrics[metric];
-    const value=metric==='turbidity'?(['较低','中等','较高'][r.turbidity]??'待更新'):(Number.isFinite(r[metric])?f(r[metric],digits)+' '+unit:'—');
+    const value=Number.isFinite(r[metric])?f(r[metric],digits)+' '+unit:'—';
     $('hour-caption').textContent=stamp(r.t)+' · '+value;
     $('hour').setAttribute('aria-valuetext',stamp(r.t)+' 墨尔本时间，'+value);
     for(const id of ['wind','swell','tide','rain']){
@@ -183,11 +244,15 @@
     }
     $('wind-direction').textContent=bearing(r.windDir);
     $('swell-detail').textContent=(r.period===null?'—':f(r.period)+' s 平均周期')+' · '+bearing(r.swellDir);
-    const names=['较低','中等','较高'], riskName=names[r.turbidity]??'数据不足';
-    $('risk-card').dataset.risk=Number.isFinite(r.turbidity)?String(r.turbidity):'unknown';
-    $('risk-label').textContent=riskName+'浑浊风险';
-    $('risk-title').textContent=Number.isFinite(r.turbidity)?(r.turbidity===2?'浑浊倾向较高':r.turbidity===1?'可能出现混浊':'浑浊风险较低'):'暂不能估算';
-    $('risk-detail').textContent=Number.isFinite(r.turbidity)?'驱动数据 '+r.riskInputs+'/4 · 不是实测 NTU':'可用驱动数据不足';
+    $('risk-title').textContent=Number.isFinite(r.turbidity)?f(r.turbidity,1)+' FNU':'暂不能估算';
+    const dist=sensorData?.station?Math.hypot((point.lat-sensorData.station.lat)*111,(point.lng-sensorData.station.lon)*111*Math.cos(point.lat*Math.PI/180)):null;
+    const obsAge=Number.isFinite(sensorData?.latest?.time)?(Date.now()/1000-sensorData.latest.time)/3600:Infinity;
+    const ageText=Number.isFinite(obsAge)?(obsAge<1?'刚更新':Math.round(obsAge)+' 小时前'):'暂无实测';
+    $('risk-detail').textContent='Tyabb Bank 实测 '+f(sensorData?.latest?.value,1)+' FNU · '+ageText+' · '+(Number.isFinite(dist)?'相距 '+f(dist,1)+' km':' ')+(fittedModel?' · '+f(fittedModel.samples,0)+' 小时拟合':' · 等待实测历史');
+    $('live-value').textContent=Number.isFinite(sensorData?.latest?.value)?f(sensorData.latest.value,2)+' FNU':'— FNU';
+    $('live-time').textContent=Number.isFinite(obsTime)?stamp(obsTime):sensorBusy?'正在读取':'实测暂不可用';
+    $('live-time').dateTime=Number.isFinite(obsTime)?new Date(obsTime*1000).toISOString():'';
+    $('forecast-model').textContent=fittedModel?(fittedModel.skill>0?`逐小时拟合 · 1h留出误差改善 ${f(fittedModel.skill*100,0)}%`:'逐小时拟合 · 尚未优于持续性基准'):'实测数据不足，暂不外推';
     if(chartX&&$('guide')){const x=chartX(active);$('guide').setAttribute('x1',x);$('guide').setAttribute('x2',x);}
   }
   function draw(){
@@ -198,14 +263,13 @@
     const [label,unit,color]=metrics[metric];
     $('chart-unit').textContent=unit;svg.setAttribute('aria-label',label+'，'+unit);svg.setAttribute('viewBox','0 0 '+w+' '+h);
     const visible=rows.slice(from,to+1), values=visible.map(r=>r[metric]).filter(Number.isFinite);
-    const low=metric==='turbidity'?0:Math.min(0,Math.floor(Math.min(0,...values)*4)/4), peak=metric==='turbidity'?2:Math.max(0,...values);
-    const step=metric==='turbidity'?1:Math.max(.25,Math.ceil(peak-low)/4);
-    const y=v=>base-(v-low)/(metric==='turbidity'?2:step*4)*(base-top);
+    const low=metric==='turbidity'?Math.max(0,Math.floor(Math.min(...values,0)*4)/4):Math.min(0,Math.floor(Math.min(0,...values)*4)/4), peak=Math.max(0,...values);
+    const step=Math.max(.25,Math.ceil((peak-low)/4*4)/4);
+    const y=v=>base-(v-low)/(step*4)*(base-top);
     let html='';
     if(range==='week')html+='<rect x="'+x(day*24)+'" y="'+top+'" width="'+(x(Math.min(167,day*24+24))-x(day*24))+'" height="'+(base-top)+'" fill="#ecf5f3"/>';
-    const ticks=metric==='turbidity'?[0,1,2]:[0,1,2,3,4].map(i=>low+i*step);
-    for(const value of ticks){
-      const yp=y(value),label=metric==='turbidity'?['较低','中等','较高'][value]:Number(value.toFixed(2));
+    for(let i=0;i<=4;i++){
+      const value=low+i*step,yp=y(value),label=Number(value.toFixed(1));
       html+='<line x1="'+left+'" x2="'+right+'" y1="'+yp+'" y2="'+yp+'" stroke="#e0eaea"/><text x="'+(left-6)+'" y="'+(yp+4)+'" text-anchor="end">'+label+'</text>';
     }
     const tickStep=range==='day'?3:12;
@@ -244,13 +308,14 @@
     const details=[
       ['selected_lat',point.lat,'selected_lon',point.lng],
       ['weather_retrieved_at',windData?.at],['offshore_marine_retrieved_at',marineData?.at],
+      ['live_sensor_site',sensorData?.station?.site],['live_sensor_value_FNU',sensorData?.latest?.value],['live_sensor_time_utc',sensorData?.latest?.time?new Date(sensorData.latest.time*1000).toISOString():null],
       ['offshore_ref_lat',offshore.lat,'offshore_ref_lon',offshore.lng],
       ['tide_copyright','Commonwealth of Australia / BOM - modified by interpolation'],
       ['tide_terms','https://www.bom.gov.au/oceanography/projects/ntc/vic_tide_tables.shtml'],
-      ['local_time_Australia_Melbourne','utc_time','estimated_turbidity_risk','wind_m_s','wind_from_deg','rain_mm','offshore_swell_hs_m','offshore_swell_mean_period_s','offshore_swell_from_deg','stony_point_reference_m_LAT']
+      ['local_time_Australia_Melbourne','utc_time','estimated_turbidity_FNU','wind_m_s','wind_from_deg','rain_mm','offshore_swell_hs_m','offshore_swell_mean_period_s','offshore_swell_from_deg','stony_point_reference_m_LAT']
     ];
     const local=new Intl.DateTimeFormat('sv-SE',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'});
-    const lines=details.concat(rows.map(r=>[local.format(r.t*1000),new Date(r.t*1000).toISOString(),['low','moderate','high'][r.turbidity]??'',r.wind,r.windDir,r.rain,r.swell,r.period,r.swellDir,r.tide]));
+    const lines=details.concat(rows.map(r=>[local.format(r.t*1000),new Date(r.t*1000).toISOString(),r.turbidity,r.wind,r.windDir,r.rain,r.swell,r.period,r.swellDir,r.tide]));
     const url=URL.createObjectURL(new Blob([lines.map(r=>r.map(v=>v??'').join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'}));
     const a=document.createElement('a');a.href=url;a.download='western-port-seven-days.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
   }
@@ -260,11 +325,11 @@
   }
   map.on('click',e=>setPoint(e.latlng));
   $('center-point').onclick=()=>setPoint(map.getCenter());
-  $('refresh').onclick=()=>{loadWind();loadMarine();};
+  $('refresh').onclick=()=>{loadWind();loadMarine();loadSensor();};
   $('week').onclick=()=>setRange('week');$('day').onclick=()=>setRange('day');
   $('metrics').onclick=e=>{if(!e.target.dataset.metric)return;metric=e.target.dataset.metric;syncControls();draw();readout();};
   $('hour').oninput=e=>chooseHour(Number(e.target.value));$('export').onclick=exportCsv;
   new ResizeObserver(()=>{map.invalidateSize({pan:false});draw();}).observe($('map'));
   new ResizeObserver(draw).observe($('chart-scroll'));
-  marineData=cached('marine',offshore);loadWind();loadMarine();
+  marineData=cached('marine',offshore);loadWind();loadMarine();loadSensor();
 })();

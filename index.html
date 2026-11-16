@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="description" content="在 Western Port 地图上点选位置，查看未来七天的浑浊风险趋势估算。">
-<title>Western Port · 浑浊风险预报</title>
+<meta name="description" content="Western Port 实时浊度实测与未来七天数值估算。">
+<title>Western Port · 浊度预报</title>
 <link rel="stylesheet" href="vendor/leaflet.css">
 <link rel="stylesheet" href="style.css">
 <script defer src="vendor/leaflet.js"></script>
@@ -14,9 +14,20 @@
 <body>
 <main>
   <header class="top">
-    <div class="brand"><span aria-hidden="true">WP</span><div><h1>Western Port</h1><p>七天浑浊风险估算 · 墨尔本时间</p></div></div>
+    <div class="brand"><span aria-hidden="true">WP</span><div><h1>Western Port</h1><p>实时实测 · 七天浊度估算</p></div></div>
     <a href="https://github.com/wenhuoo/wpwaterforecast#readme">数据与方法 ↗</a>
   </header>
+  <section class="panel forecast" aria-labelledby="forecast-title">
+    <div class="panel-head">
+      <h2 id="forecast-title">未来七天浊度预测</h2>
+      <div class="segments" role="group" aria-label="时间范围"><button id="week" type="button" aria-pressed="true">七天</button><button id="day" type="button" aria-pressed="false">24 小时</button></div>
+    </div>
+    <div id="days" class="days" aria-label="按日查看"></div>
+    <div class="station-reading"><div><b>Tyabb Bank 实时实测</b><time id="live-time">正在读取</time></div><strong id="live-value">— FNU</strong></div>
+    <div class="chart-head"><span id="chart-caption">逐小时浊度估算</span><span id="forecast-model"></span><span id="chart-unit"></span></div>
+    <div id="chart-scroll" class="chart-scroll" tabindex="0" aria-label="时间图表，可横向滚动"><svg id="chart" role="img"></svg></div>
+    <div class="time-control"><label for="hour" id="hour-caption">查看时刻</label><input id="hour" type="range" min="0" max="167" value="0" aria-label="查看时刻"><button id="export" type="button">CSV</button></div>
+  </section>
   <div class="overview">
     <section class="panel map-card" aria-labelledby="map-title">
       <div class="panel-head"><h2 id="map-title">地图选点</h2><span>点击地图查看</span></div>
@@ -24,25 +35,14 @@
       <div class="map-foot"><span id="coordinates">—</span><button id="center-point" type="button">选择地图中心</button></div>
     </section>
     <section class="panel turbidity-now" aria-labelledby="quick-title">
-      <div class="panel-head"><h2 id="quick-title">当前时刻浑浊风险</h2><time id="selected-time"></time></div>
+      <div class="panel-head"><h2 id="quick-title">所选时刻浊度估算</h2><time id="selected-time"></time></div>
       <div id="risk-card" class="risk-card" data-risk="unknown">
-        <span id="risk-label" class="risk-label">计算中</span>
         <strong id="risk-title">正在载入预报</strong>
-        <p id="risk-detail">基于风、外海涌浪、潮位变化与降雨估算</p>
+        <p id="risk-detail">等待实测浊度和天气数据</p>
       </div>
       <div class="quick-foot"><span id="status" role="status">正在载入</span><button id="refresh" type="button">刷新</button></div>
     </section>
   </div>
-  <section class="panel forecast" aria-labelledby="forecast-title">
-    <div class="panel-head">
-      <h2 id="forecast-title">未来七天浑浊趋势</h2>
-      <div class="segments" role="group" aria-label="时间范围"><button id="week" type="button" aria-pressed="true">七天</button><button id="day" type="button" aria-pressed="false">24 小时</button></div>
-    </div>
-    <div id="days" class="days" aria-label="按日查看"></div>
-    <div class="chart-head"><span id="chart-caption">浑浊风险趋势</span><span id="chart-unit"></span></div>
-    <div id="chart-scroll" class="chart-scroll" tabindex="0" aria-label="时间图表，可横向滚动"><svg id="chart" role="img"></svg></div>
-    <div class="time-control"><label for="hour" id="hour-caption">查看时刻</label><input id="hour" type="range" min="0" max="167" value="0" aria-label="查看时刻"><button id="export" type="button">CSV</button></div>
-  </section>
   <details class="panel optional-inputs">
     <summary>影响因素 <span id="factor-summary">风 · 浪 · 潮 · 雨</span></summary>
     <div class="factor-grid">
@@ -51,9 +51,9 @@
       <div class="reading"><span class="dot tide"></span><div><h3>Stony Point 潮位</h3><small>全湾共用参考</small></div><strong id="tide-value">—</strong></div>
       <div class="reading"><span class="dot rain"></span><div><h3>当地降雨</h3></div><strong id="rain-value">—</strong></div>
     </div>
-    <div class="factor-tools"><div class="segments" id="metrics" role="group" aria-label="图表指标"><button type="button" data-metric="wind" aria-pressed="false">风速</button><button type="button" data-metric="swell" aria-pressed="false">涌浪</button><button type="button" data-metric="tide" aria-pressed="false">潮位</button><button type="button" data-metric="rain" aria-pressed="false">降雨</button></div><span id="status-detail">来源与限制见 README</span></div>
+    <div class="factor-tools"><div class="segments" id="metrics" role="group" aria-label="图表指标"><button type="button" data-metric="turbidity" aria-pressed="true">浊度 FNU</button><button type="button" data-metric="wind" aria-pressed="false">风速</button><button type="button" data-metric="swell" aria-pressed="false">涌浪</button><button type="button" data-metric="tide" aria-pressed="false">潮位</button><button type="button" data-metric="rain" aria-pressed="false">降雨</button></div><span id="status-detail">模型方法和限制见 README</span></div>
   </details>
-  <footer><span>浑浊风险估算 · 非实测 NTU</span><span><a href="https://open-meteo.com/en/docs">Open-Meteo</a> · <a href="https://open-meteo.com/en/docs/marine-weather-api">Météo-France MFWAM / Copernicus</a> · <a href="https://www.bom.gov.au/oceanography/projects/ntc/vic_tide_tables.shtml">BOM</a></span></footer>
+  <footer><span>模型估算 FNU · 实测站与误差见 README</span><span><a href="https://imoslive.aodn.org.au">IMOS 实测</a> · <a href="https://open-meteo.com/en/docs">Open-Meteo</a> · <a href="https://www.bom.gov.au/oceanography/projects/ntc/vic_tide_tables.shtml">BOM 潮位</a></span></footer>
 </main>
 </body>
 </html>
