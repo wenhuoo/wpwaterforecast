@@ -3,7 +3,7 @@ import {readFile, stat} from 'node:fs/promises';
 import {extname, resolve, sep} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
-const root = fileURLToPath(new URL('.', import.meta.url));
+const root = resolve(fileURLToPath(new URL('.', import.meta.url)));
 const port = Number(process.env.PORT || 8768);
 const station = {site:'VIC-WESTERN-PORT',lat:-38.2657,lon:145.2745,depth:0.7,unit:'FNU'};
 const api = 'https://imoslive.aodn.org.au/api/v1/ogc/collections/dummy_collection_id_satisfying_api/items';
